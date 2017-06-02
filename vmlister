@@ -1,0 +1,202 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[15]:
+
+# https://www.vmware.com/support/developer/vc-sdk/visdk2xpubs/ReferenceGuide/
+
+import atexit
+import pwd
+import getpass
+import sys
+import os
+import pprint
+import time
+from socket import gethostname
+
+# PROD
+VMWAREUSR = "USERNAME"
+VMWAREPWD = "PASSWORD"
+VMWAREHOST = "VCENTER FQDN"
+
+
+# Ugly fix for insecure cert (remove when pyvmomi is updated with function for insecure cert)
+# https://github.com/vmware/pyvmomi/issues/179
+import requests
+requests.packages.urllib3.disable_warnings()
+import ssl
+try:
+    _create_unverified_https_context = ssl._create_unverified_context
+except AttributeError:
+    pass
+else:
+    # Handle target environment that doesn't support HTTPS verification
+    ssl._create_default_https_context = _create_unverified_https_context
+#End ugly fix
+
+import pyVmomi
+import argparse
+from pyVim import connect
+from pyVmomi import vmodl
+from pyVmomi import vim
+
+vcenters = {'1': VMWAREHOST}
+
+status_map = {'gray':  'The status is unknown.',  'green': 'The entity is OK.',\
+    'red': 'The entity definitely has a problem.',\
+    'yellow':  'The entity might have a problem.' }
+
+
+def check_modules(modules):
+    ''' Check if module is loaded'''
+    for mod in modules:
+        if not mod in sys.modules.keys():
+            print ( "Module {0} missing install it".format(mod))
+
+class Config():
+    def startconnection(self):
+        print "Connecting to %s" %  self.vcenter
+        self.service_instance = connect.SmartConnect(host=self.vcenter, user=self.user, pwd=self.vpwd)
+        atexit.register(connect.Disconnect, self.service_instance)
+        self.content = self.service_instance.RetrieveContent()
+        self.object_view = self.content.viewManager.CreateContainerView(self.content.rootFolder, [], True)
+
+    def setnewvcenter(self, vcenter):
+        self.vcenter = vcenter
+        connect.Disconnect(self.service_instance)
+        del(self.content)
+        del(self.object_view)
+        del(self.service_instance)
+        print "Connecting to %s" %  self.vcenter
+        self.service_instance = connect.SmartConnect(host=self.vcenter, user=self.user, pwd=self.vpwd)
+        atexit.register(connect.Disconnect, self.service_instance)
+        self.content = self.service_instance.RetrieveContent()
+        self.object_view = self.content.viewManager.CreateContainerView(self.content.rootFolder, [], True)
+
+
+    def __init__(self, vcenter):
+        self.user = VMWAREUSR
+        self.vcenter = vcenter
+        #self.vpwd = getpass.getpass('Password for user %s :' % self.user )
+        self.vpwd = VMWAREPWD
+
+def print_vm_devices(vm_config):
+    for dev in vm_config.hardware.device:
+        print 'Device : ', dev
+        print
+
+def print_vm_disks(vm):
+    for d in vm.disks:
+        print 'Disk : ', d
+
+def print_vm_datastores(vm):
+    for d in vm.datastore:
+        print 'Datastore : ', d.summary
+
+def print_vm_networks(vm):
+    for n in vm.network:
+        print "%-18s %s" % (('\033[1;32mNetwork Up:' if n.summary.accessible else '\033[1;31mNetwork Down:'), n.summary.name + '\033[1;m')
+
+def print_vm_info(vm, depth=1, max_depth=10, vmname="", vcenter=""):
+    """
+    Print information for a particular virtual machine or recurse into a
+    folder with depth protection
+    """
+
+    # if this is a group it will have children. if it does, recurse into them
+    # and then return
+    if hasattr(vm, 'childEntity'):
+        if depth > max_depth:
+            return
+        vmList = vm.childEntity
+        for c in vmList:
+            print_vm_info(c, depth + 1, vmname=vmname)
+        return
+
+    summary = vm.summary
+    if '' in summary.config.name: # for simple testing temporary
+        print "%-18s %s" % ("Name: ", summary.config.name)
+        print "%-18s %s" % ("Vcenter: ", vcenter)
+        print "%-18s %s %s%s" % ("Power: ", ('\033[1;32m' if vm.runtime.powerState == 'poweredOn' else '\033[1;31m'), vm.runtime.powerState, '\033[1;m')
+        print "%-18s %s" % ("Guest: ", summary.config.guestFullName)
+        print "%-18s %s" % ("Path: ", summary.config.vmPathName)
+        print "%-18s %s" % ("Memory (Ram MB): ", summary.config.memorySizeMB)
+        print "%-18s %s" % ('Num cpu: ', summary.config.numCpu)
+        print_vm_networks(vm)
+        print "Storage Commited: %.1f GB ; Uncommited %.1f GB " %  (int(summary.storage.committed) / 1073741824.0, int(summary.storage.uncommitted) / 1073741824.0)
+        print "Esx Host: ", vm.runtime.host.summary.config.name
+        #print 'Storage : ', vm.storage.perDatastoreUsage
+        #print_vm_datastores(vm)
+        #print 'Network : ', dir(vm.network)
+        #print 'Network : ', vm.network.summary
+        #print 'Config dict : ', summary.config.__dict__
+
+        #print_vm_devices(vm.config)
+
+        #print_vm_disks(vm) Borken
+
+        #print 'Datastore : ', vm.datastore, vm.datastore.__class__
+        #annotation = summary.config.annotation
+        #if annotation:
+        #   print "Annotation : ", annotation
+        #print "State : ", summary.runtime.powerState
+
+        #print "Runtime  : ", summary.runtime
+        #if summary.guest is not None:
+        #    ip = summary.guest.ipAddress
+        #    if ip:
+        #        print "IP : ", ip
+        #if summary.runtime.question is not None:
+        #    print "Question : ", summary.runtime.question.text
+        print ""
+        print ""
+
+#print out details of vm
+def print_vms(object_view, config, vmname=""):
+    print "trying to find", vmname
+    time.sleep(1)
+    '''vmname lets us filter on name'''
+    for obj in object_view.view:
+        #print 'obj: ', obj.__dict__
+        if isinstance(obj, vim.VirtualMachine):
+            if vmname != "":
+                if vmname in obj.summary.config.name:
+                    print_vm_info(obj, vmname, vcenter=config.vcenter)
+            else:
+                print_vm_info(obj, vmname, vcenter=config.vcenter)
+
+def hilightMatch(string, match):
+    ''' prints in red'''
+    if match in string:
+        return '\033[1;31m' + string + '\033[1;m'
+    else:
+        return string
+
+def sizeof_fmt(num):
+    """
+    pretty print size of DS
+    Returns the human readable version of a file size
+    :param num:
+    :return:
+    """
+    for item in ['bytes', 'KB', 'MB', 'GB']:
+        if num < 1024.0:
+            return "%3.1f%s" % (num, item)
+        num /= 1024.0
+    return "%3.1f%s" % (num, 'TB')
+
+
+def main():
+    if len(sys.argv) == 2:
+        findvm = sys.argv[1]
+    else:
+        findvm = ""
+    config = Config(vcenters['1'])
+    config.startconnection()
+    print_vms(config.object_view, config, findvm )
+
+    #config.setnewvcenter(vcenters['2'])
+    #print_vms(config.object_view, config, findvm )
+
+if __name__ in '__main__':
+    main()

@@ -1,0 +1,430 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[15]:
+
+# https://www.vmware.com/support/developer/vc-sdk/visdk2xpubs/ReferenceGuide/
+
+import atexit
+import pwd
+import getpass
+import sys
+import os
+import pprint
+import time
+from  socket import gethostname
+
+# Ugly fix for insecure cert (remove when pyvmomi is updated with function for insecure cert)
+# https://github.com/vmware/pyvmomi/issues/179
+import requests
+requests.packages.urllib3.disable_warnings()
+import ssl
+try:
+    _create_unverified_https_context = ssl._create_unverified_context
+except AttributeError:
+    pass
+else:
+    # Handle target environment that doesn't support HTTPS verification
+    ssl._create_default_https_context = _create_unverified_https_context
+#End ugly fix
+
+import pyVmomi
+import argparse
+from pyVim import connect
+from pyVmomi import vmodl
+from pyVmomi import vim
+
+HIGHLIGHT_NET = '10.13.7.0'
+
+status_map = {'gray':  'The status is unknown.',  'green': 'The entity is OK.',\
+    'red': 'The entity definitely has a problem.',\
+    'yellow':  'The entity might have a problem.' }
+
+def check_modules(modules):
+    ''' Check if module is loaded'''
+    for mod in modules:
+        if not mod in sys.modules.keys():
+            print ( "Module {0} missing install it".format(mod))
+
+def GetPwdFromKeyringOrInput(service, username):
+	return getpass.getpass("Enter password (will not be stored): ")
+
+class Config():
+    def startconnection(self):
+        self.service_instance = connect.SmartConnect(host=self.vcenter, user=self.user, pwd=self.vpwd)
+        atexit.register(connect.Disconnect, self.service_instance)
+        self.content = self.service_instance.RetrieveContent()
+        self.object_view = self.content.viewManager.CreateContainerView(self.content.rootFolder, [], True)
+
+    def validate_missing(self):
+        self.helps = {}
+        for f in self.parser._actions:
+            if isinstance (f, argparse._StoreAction):
+                self.helps[getattr(f,'dest')] = getattr(f,'help', getattr(f,'dest'))
+
+        for conf in ['vm_name','memoryMB','numcores', 'user', 'vcenter', 'disksize']: # mandatory arguments
+            if not self.args[conf]:
+                self.args[conf] = raw_input( self.helps[conf] + ': ' ).strip()
+
+    def __init__(self):
+        self.parser = argparse.ArgumentParser(description='Virtual machine creator.')
+        self.parser.add_argument('-V' '--vcenter',
+            dest='vcenter',
+            action='store',
+            default=None,
+            help='vcenter to connect to')
+
+        self.parser.add_argument('-u' '--user',
+            dest='user',
+            action='store',
+            default=None,
+            help='vcenter login')
+
+        self.parser.add_argument('-n' '--vm_name',
+            dest='vm_name',
+            action='store',
+            help='short vm_name (without domainpart)')
+
+        self.parser.add_argument('-r' '--memoryMB',
+            dest='memoryMB',
+            action='store',
+            help='Memory for the vm in GB')
+
+        self.parser.add_argument('-c' '--numcores',
+            dest='numcores',
+            action='store',
+            help='Number of cores')
+
+        self.parser.add_argument('-d' '--disksize',
+            dest='disksize',
+            action='store',
+            help='Disksize in GB')
+
+        self.args = vars(self.parser.parse_args())
+        self.validate_missing()
+        self.args['vpwd'] = GetPwdFromKeyringOrInput( )
+        for k in self.args.keys():
+            if k == 'memoryMB':
+                self.args[k] = int(self.args[k]) * 1024
+            elif k == 'numcores':
+                self.args[k] = int(self.args[k])
+            elif k == 'disksize':
+                self.args[k] = int(self.args[k])
+
+            setattr(self, k, self.args[k])
+
+def get_datacenter_and_folder(content):
+    datacenter = content.rootFolder.childEntity[0]
+    print "using Datacenter: ", datacenter
+    print "using Folder: ", datacenter.vmFolder
+    return (datacenter, datacenter.vmFolder)
+
+def checktask(task, error_mesg, success_mesg="Success"):
+    '''(status_mesg,task_status) = checktask(task,"Error in creating vm:")'''
+    while task.info.state == vim.TaskInfo.State.running:
+        time.sleep(2)
+
+    if task.info.state != vim.TaskInfo.State.success:
+        print "%s: %s"%(error_mesg,task.info.error)
+        return (task.info.error,False)
+    else:
+        print "%s"%(success_mesg)
+        return (task.info.result,True)
+
+def print_vm_info(vm, depth=1, max_depth=10):
+    """
+    Print information for a particular virtual machine or recurse into a
+    folder with depth protection
+    """
+
+    # if this is a group it will have children. if it does, recurse into them
+    # and then return
+    if hasattr(vm, 'childEntity'):
+        if depth > max_depth:
+            return
+        vmList = vm.childEntity
+        for c in vmList:
+            print_vm_info(c, depth + 1)
+        return
+
+    summary = vm.summary
+    if 'mdlas' in summary.config.name: # for simple testing temporary
+        print "Power : ", vm.runtime.powerState
+        print "Guest : ", summary.config.guestFullName
+        print "Name : ", summary.config.name
+        print "Path : ", summary.config.vmPathName
+        print 'Memory (MB) : ', summary.config.memorySizeMB
+        print 'Num cpu : ', summary.config.numCpu
+        print 'Storage : ', vm.storage
+        for d in vm.datastore:
+            print 'Datastore : ', d.summary
+        #print 'Network : ', dir(vm.network)
+        for n in vm.network:
+            print 'Network : ', n.summary
+        print 'Config dict : ', summary.config.__dict__
+        for dev in vm.config.hardware.device:
+            print 'Device : ', dev
+            print
+        #for d in vm.disks:
+        #    print 'Disk : ', d
+        #print 'Datastore : ', vm.datastore, vm.datastore.__class__
+        #annotation = summary.config.annotation
+        #if annotation:
+        #   print "Annotation : ", annotation
+        #print "State : ", summary.runtime.powerState
+        print "Runtime  : ", summary.runtime
+        if summary.guest is not None:
+            ip = summary.guest.ipAddress
+            if ip:
+                print "IP : ", ip
+        if summary.runtime.question is not None:
+            print "Question : ", summary.runtime.question.text
+        print ""
+
+#print out details of vm
+def print_vms(object_view):
+    for obj in object_view.view:
+        #print 'obj: ', obj.__dict__
+        if isinstance(obj, vim.VirtualMachine):
+            print_vm_info(obj)
+
+def find_vm(object_view, name):
+    for obj in object_view.view:
+        #print 'obj: ', obj.__dict__
+        if isinstance(obj, vim.VirtualMachine):
+            if obj.name == name:
+                return obj
+
+def get_resource_pools(object_view):
+    '''Get avaliable resource pools'''
+    resourcepools = []
+    for obj in object_view.view:
+        if isinstance(obj, vim.ResourcePool):
+            resourcepools.append(obj)
+    return resourcepools
+
+def get_networks(object_view):
+    '''Get avaliable resource pools'''
+    networks = []
+    for obj in object_view.view:
+        if isinstance(obj, vim.Network):
+            networks.append(obj)
+    return networks
+
+def get_dvp(object_view): # vim.dvs.DistributedVirtualPortgroup
+    '''Get avaliable resource pools'''
+    dvps = []
+    for obj in object_view.view:
+        if isinstance(obj, vim.dvs.DistributedVirtualPortgroup):
+            dvps.append(obj)
+    for dvp in dvps:
+        print dvp.name
+
+def hilightMatch(string, match):
+    ''' prints in red'''
+    if match in string:
+        return '\033[1;31m' + string + '\033[1;m'
+    else:
+        return string
+
+def pick_network(object_view, deploy=False): # vim.dvs.DistributedVirtualPortgroup
+    networks = get_networks(object_view)
+    networks_dict = {}
+    for idx, obj in enumerate(networks, 1) :
+        networks_dict[idx] = obj
+    for idx in networks_dict.keys()[1::2]:
+        if deploy:
+            print "%-3s %-30s\t%-3s %-30s" % (idx-1, hilightMatch(networks_dict[idx-1].name, HIGHLIGHT_NET), idx, hilightMatch(networks_dict[idx].name, HIGHLIGHT_NET))
+        else:
+            print "%-3s %-30s\t%-3s %-30s" % (idx-1, networks_dict[idx-1].name, idx, networks_dict[idx].name)
+    while True:
+        reply = raw_input('Pick network %s' % '1-' + str( len(networks_dict.keys()) - 1 ) + ':' )
+        reply = int(reply)
+        if reply in networks_dict.keys():
+            print networks_dict[reply].name, '\n'
+            return networks_dict[reply]
+
+def pick_resource_pool(object_view):
+    '''Pick one of the resource pools'''
+    resourcepools = get_resource_pools(object_view)
+    resourcepoolsdict = {}
+    print "idx) %-21s%-21s\tStatus" % ('Name', 'MemUsage')
+    for idx, obj in enumerate(resourcepools, 1):
+        resourcepoolsdict[str(idx)] = obj
+        summary =  obj.summary.__dict__
+        rpmemconfig = summary['runtime'].memory.__dict__ #vim.ResourcePool.RuntimeInfo
+        status = summary['runtime'].__dict__['overallStatus'] #vim.ResourcePool.RuntimeInfo
+        print "%-4s %-20s" % ( str(idx) + ')', summary['name']),
+        #print summary['runtime'].memory.__dict__ #vim.ResourcePool.RuntimeInfo #debug
+        poolreservation = sizeof_fmt(rpmemconfig['reservationUsed'] + rpmemconfig['unreservedForVm']).strip()
+        memusagestr = sizeof_fmt(rpmemconfig['reservationUsedForVm']) + ' / ' + poolreservation
+        print '%-22s%-10s' % ( memusagestr, status_map[status] )
+    while True:
+        reply = raw_input('Pick Resource Pool %s' % '0-' + str( len(resourcepoolsdict.keys()) - 1 ) + ':' )
+        if reply in resourcepoolsdict.keys():
+            print resourcepoolsdict[reply].summary.__dict__['name'], '\n'
+            return resourcepoolsdict[reply]
+
+def get_datastores(object_view):
+    '''Get available datastores'''
+    usable_datastores = []
+    for obj in object_view.view:
+        if isinstance(obj, vim.Datastore):# pyVmomi.VmomiSupport.vim.Datastore
+            summary = obj.summary.__dict__
+            if not summary['accessible'] == True or not 'vmfs' in summary['type'].lower() or not summary['multipleHostAccess'] == True:
+        #print "Not accessible!: ", summary['name'] #debug
+                continue
+            usable_datastores.append((summary['name'], sizeof_fmt(summary['freeSpace']))) # append usable_datastores
+            #print summary['name'], ': ', sizeof_fmt(summary['freeSpace']), '\n', obj.summary.__dict__, '\n' # debug
+    return usable_datastores
+
+def pick_datastore(object_view):
+    datastores = get_datastores(object_view)
+    usable_datastoresdict = {}
+    for idx, val in enumerate(datastores, 1):
+        usable_datastoresdict[str(idx)] = val
+        print '%s) %s: %s ' % (idx, val[0], val[1])
+    while True:
+        reply = raw_input('Pick datastore:')
+        if reply in usable_datastoresdict.keys():
+            print usable_datastoresdict[reply][0]
+            return usable_datastoresdict[reply][0]
+
+def sizeof_fmt(num):
+    """
+    pretty print size of DS
+    Returns the human readable version of a file size
+    :param num:
+    :return:
+    """
+    for item in ['bytes', 'KB', 'MB', 'GB']:
+        if num < 1024.0:
+            return "%3.1f%s" % (num, item)
+        num /= 1024.0
+    return "%3.1f%s" % (num, 'TB')
+
+
+class VmConfigCreator():
+    def __init__(self, confs):
+        self.confs = confs
+        self.getConfigs()
+        self.vdevicelist = []
+        self.disk_creator()
+        self.nic_creator()
+        self.vmx_file = vim.vm.FileInfo(logDirectory=None, snapshotDirectory=None, suspendDirectory=None, vmPathName=self.datastore_path )
+        #TODO ethernet, disk_creator
+        #self.hostname_dns()
+        #self.confmgmt() #i.e puppet / sattelite
+
+        def hostname_dns(self):
+            pass
+
+        def cfg_management(self):
+            pass
+
+        def power_on(self):
+            pass
+
+        def power_off(self):
+            pass
+
+    def disk_creator(self):
+        #self.datastore_path = '[' + pick_datastore() + ']' + self.vm_name
+        self.datastore_path = "[%s]%s/%s.vmx"%(pick_datastore(self.confs.object_view), self.vm_name, self.vm_name)
+        self.vdisk1 = vim.vm.device.VirtualDisk(capacityInKB = self.disksize * 1024 * 1024)
+        self.vdisk1.unitNumber = 0
+        self.vdisk1.controllerKey = 1
+        self.vdisk1BackingInfo = vim.vm.device.VirtualDisk.FlatVer2BackingInfo()
+        self.vdisk1BackingInfo.diskMode = "persistent"
+        #self.vdisk1BackingInfo.thinProvisioned = True
+        self.vdisk1BackingInfo.eagerlyScrub = True
+        self.vdisk1.backing = self.vdisk1BackingInfo
+        self.vdiskspec = vim.vm.device.VirtualDeviceSpec()
+        self.vdiskspec.device = self.vdisk1
+        self.vdiskspec.fileOperation = "create"
+        self.vdiskspec.operation = "add"
+        self.vdevicelist.append(self.vdiskspec)
+
+        self.vctl1 = vim.vm.device.ParaVirtualSCSIController()
+        self.vctl1.key = 1
+        self.vctl1.sharedBus = "noSharing"
+        self.vctlspec = vim.vm.device.VirtualDeviceSpec()
+        self.vctlspec.device = self.vctl1
+        self.vctlspec.operation = "add"
+        self.vdevicelist.append(self.vctlspec)
+
+    def changeNet(self,targetnet): ## TODO set the correct network AFTER install and then boot on to that net
+        newvm = content.searchIndex.FindChild(content.rootFolder.childEntity[0].vmFolder,vmname)
+        vmdev = newvm.config.hardware.device
+        vnic1 = vim.vm.device.VirtualDeviceSpec()
+        vnic1.operation = "edit"
+        for dev in vmdev:
+            if type(dev) is vim.vm.device.VirtualE1000:
+                vnic1.device = dev
+
+    def nic_creator(self):
+        self.vnic1 = vim.vm.device.VirtualDeviceSpec()
+        self.vnic1.operation = "add"
+        #self.vnic1.device = vim.vm.device.VirtualE1000()
+        self.vnic1.device = vim.vm.device.VirtualVmxnet3()
+        self.vnic1.device.key = 1
+
+        self.dvs_port_connection = vim.dvs.PortConnection()
+        print self.network.key
+        self.dvs_port_connection.portgroupKey = self.network.key
+        self.dvs_port_connection.switchUuid = self.network.config.distributedVirtualSwitch.uuid
+        self.vnic1.device.backing = vim.vm.device.VirtualEthernetCard.DistributedVirtualPortBackingInfo()
+        self.vnic1.device.backing.port = self.dvs_port_connection
+        self.vnic1.device.connectable = vim.vm.device.VirtualDevice.ConnectInfo()
+        self.vnic1.device.connectable.startConnected = True
+        self.vdevicelist.append(self.vnic1)
+
+    def vm_creator(self):
+        self.config = vim.vm.ConfigSpec(name=self.vm_name, memoryMB=int(self.memoryMB), numCPUs=int(self.numcores),\
+            files=self.vmx_file, guestId='rhel6_64Guest', version='vmx-07', deviceChange=self.vdevicelist)
+
+        self.task = self.vm_folder.CreateVM_Task(config=self.config, pool=self.resource_pool)
+        (self.vmcreatestatus_msg,self.createvmtask_status) = checktask(self.task,"Error in creating vm: %s" % self.vm_name )
+        if not self.createvmtask_status:
+            print self.vmcreatestatus_msg
+            sys.exit(2)
+
+    def poweronvm(self):
+        self.createdVM = find_vm(self.confs.object_view, self.vm_name)
+        poweronvm = raw_input('Power on vm Y/n?').strip().lower() or 'n'
+        if poweronvm in 'y':
+            (self.vmcpoweron_msg,self.poweron_status) = checktask(self.createdVM.PowerOn() ,"Error powering on: %s")
+            if not self.poweron_status:
+                print self.vmcpoweron_msg
+                sys.exit(2)
+        sys.exit(0)
+
+    def printer(self):
+        print '\nName: %s' % self.vm_name
+        print 'Folder: %s' % self.vm_folder.name
+        self.vmstr = pprint.pformat(self.__dict__).strip("{},'")
+        for c in list("{},'"):
+            self.vmstr = self.vmstr.replace(c, '')
+        print self.vmstr
+
+    def getConfigs(self):
+        for k in self.confs.args.keys():
+            if not k == 'vpwd': setattr(self, k, self.confs.args[k])
+        self.datacenter, self.vm_folder = get_datacenter_and_folder(self.confs.content)
+        self.resource_pool = pick_resource_pool(self.confs.object_view)
+        self.network = pick_network(self.confs.object_view, deploy=True)
+
+def main():
+    config = Config()
+    config.startconnection()
+    #print_vms()
+    #get_dvp()
+    #pick_network()
+    vm = VmConfigCreator(config)
+    vm.vm_creator()
+    vm.printer()
+    time.sleep(2)
+    vm.poweronvm()
+
+if __name__ in '__main__':
+    main()
